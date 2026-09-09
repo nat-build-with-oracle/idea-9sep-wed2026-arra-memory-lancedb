@@ -65,6 +65,20 @@ There is no prebuilt image yet, so Supervisor builds the container on the host
 from `arra-memory/Dockerfile` (Alpine base + Bun; `@lancedb/lancedb` ships
 `linux-x64-musl` and `linux-arm64-musl` binaries).
 
+Two things to know before you install it:
+
+- **A different slug means a different `/data`.** Supervisor gives every add-on
+  its own persistent directory keyed by slug, so `arra_memory_lancedb` starts
+  with an empty corpus and cannot see `arra_memory`'s. That is deliberate — the
+  two run side by side while you compare them — and it is why the importer
+  below exists.
+- **This lives in a lab directory, not at a repository root.** `repository.yaml`
+  and `.github/workflows/builder.yml` only do their jobs when they are the root
+  of the repo Home Assistant and GitHub Actions are pointed at. Until this
+  graduates out of `ψ/lab/`, add it by copying `arra-memory/` into the host's
+  `/addons` folder rather than by adding a repository URL, and expect the
+  publish workflow not to run.
+
 ## Bring an existing corpus across
 
 The libSQL add-on keeps everything in one file at `/data/arra-memory.db`. Take it
