@@ -34,11 +34,7 @@ RUN apk add --no-cache libstdc++ unzip curl jq \
 
 WORKDIR /app
 
-# Dependencies first, so editing source does not re-resolve the whole tree.
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
-
-COPY tsconfig.json ./
+COPY package.json bun.lock tsconfig.json config.yaml ./
 COPY src/ ./src/
 COPY public/ ./public/
 # scripts/ is part of the BUILD, not just tooling — build:ui runs
@@ -46,16 +42,41 @@ COPY public/ ./public/
 # "Module not found", which Supervisor then reports as a successful update
 # that quietly leaves the previous version installed.
 COPY scripts/ ./scripts/
-# config.yaml is a BUILD INPUT, not just Supervisor's manifest: sync-version.ts
-# reads the version out of it so the running server can state which build it is.
-# It is the single source of truth precisely because Supervisor reads it too.
-COPY config.yaml ./config.yaml
 
-# The React bundle and the stylesheet are built into the image, never shipped
-# in git — a built asset in a repo is a merge conflict waiting to happen.
-RUN bun run build:ui \
+# Install, build the UI, and shed what neither step leaves behind — all in ONE
+# layer, because that is the only kind of deletion that makes an image smaller.
+# A `rm -rf` in a later RUN records a whiteout over bytes the earlier layer
+# still carries, so the download and the disk cost stay exactly the same.
+#
+# What is shed, and why it is safe:
+#   onnxruntime-node, @huggingface/transformers, openai — 220MB of ML runtime
+#     that @lancedb/lancedb lists as OPTIONAL dependencies for its built-in
+#     embedding registry. This add-on never imports lancedb/embedding/*; its
+#     vectors come from Ollama over HTTP (embedding.ts). Optionals cannot be
+#     skipped wholesale with --omit=optional: that also drops lancedb's own
+#     native binding AND @tailwindcss/oxide, and the build then fails in the
+#     stylesheet step with npm's "optional dependencies bug" message.
+#   devDependencies — tailwind, typescript and the type packages exist to
+#     produce public/app.css and public/main.js, which by this point are built.
+#     `--production` reconciles node_modules down to the runtime set.
+#   lancedb-linux-*-gnu — os/cpu matching does not consider libc, so Bun
+#     installs BOTH the gnu and the musl binding on Alpine and the gnu one can
+#     never load here. Measured on ghcr.io/home-assistant/aarch64-base:3.22.
+# The `test` lines turn a silently missing native binding or an empty bundle
+# into a failed build rather than a container that dies on first request, and
+# the `bun -e` actually dlopens the binding — the one check that proves musl
+# rather than merely proving a directory exists.
+RUN bun install --frozen-lockfile \
+ && test -d node_modules/@lancedb/lancedb-linux-*-musl \
+ && bun run build:ui \
  && test -s public/main.js \
- && test -s public/app.css
+ && test -s public/app.css \
+ && bun install --frozen-lockfile --production \
+ && rm -rf node_modules/onnxruntime-node node_modules/@huggingface node_modules/openai \
+           node_modules/@lancedb/lancedb-linux-*-gnu \
+ && test -d node_modules/@lancedb/lancedb-linux-*-musl \
+ && bun -e 'const l = await import("@lancedb/lancedb"); const d = await l.connect("/tmp/probe"); await d.tableNames()' \
+ && rm -rf /root/.bun/install/cache /tmp/*
 
 COPY run.sh /run.sh
 RUN chmod 0755 /run.sh

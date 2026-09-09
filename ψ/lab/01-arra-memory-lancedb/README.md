@@ -65,6 +65,31 @@ There is no prebuilt image yet, so Supervisor builds the container on the host
 from `arra-memory/Dockerfile` (Alpine base + Bun; `@lancedb/lancedb` ships
 `linux-x64-musl` and `linux-arm64-musl` binaries).
 
+## Bring an existing corpus across
+
+The libSQL add-on keeps everything in one file at `/data/arra-memory.db`. Take it
+from a Home Assistant backup (or copy it off the guest) and:
+
+```bash
+cd arra-memory
+LANCEDB_URI=/data/lancedb bun scripts/import-libsql.ts /path/to/arra-memory.db
+#                                                       --dry-run to look first
+```
+
+It opens the source **read-only** and moves every table, not just the memories:
+the search log, the `kv` table that remembers which MCP tools you switched off,
+and the OAuth tables — so the claude.ai connector keeps working instead of
+needing re-approval. Vectors come across decoded from `F32_BLOB`, so semantic
+search works immediately with no re-embed. Upserts by primary key, so a re-run
+after a partial import fills the gaps rather than doubling the corpus.
+
+If the source's vectors are a different width than this instance's
+`embedding_dimensions`, it stops and says so; `--force` imports the text with
+vectors cleared and leaves `POST /api/index/backfill` to rebuild them.
+
+`src/import.test.ts` proves all of the above against a database built with
+upstream's shipped schema.
+
 Everything about connecting Claude Code, Codex and claude.ai — OAuth discovery,
 `claude mcp add … --transport http`, the `--header` ordering trap, tunnels and
 `public_url` — is unchanged from upstream and documented in
@@ -90,9 +115,46 @@ Two LanceDB facts that shaped the code and are worth knowing before touching it:
 - The FTS tokenizer defaults `removeStopWords: true` and `stem: true`, which
   silently makes "are" and "the" unfindable and mangles trigrams. Both are off.
 
+## Measured (m5, Apple Silicon, Bun 1.3.14, no embedder)
+
+The in-process ordering and grouping is the design decision most worth
+checking, so here it is at two corpus sizes — synthetic rows with 480-char
+bodies, warm process, single run:
+
+| operation | 3,000 memories | 30,000 memories |
+|---|---|---|
+| list newest 30 (`topRows`) | 10 ms | 37 ms |
+| list newest 30, one workspace | 4 ms | 9 ms |
+| FTS "ความจำ" | 7 ms | 9 ms |
+| FTS, scoped to 2 workspaces + kind | 5 ms | 10 ms |
+| 2-char query (substring scan) | 40 ms | 350 ms |
+| tag filter only (full scan) | 26 ms | 229 ms |
+| `listFacets` (every chip row) | 15 ms | 100 ms |
+| range search, last 24h | 7 ms | 7 ms |
+| create / get / update | 4 / 1 / 5 ms | 3 / 4 / 5 ms |
+| insert 3k / 30k rows in 500-row batches | 70 ms | 411 ms |
+
+The two slow rows at 30k are the paths that read every body: queries shorter
+than a trigram and a tag-only filter. If a corpus ever gets there, a lowercased
+`tags_lc` column would turn the tag path into a server-side `array_has`.
+
 ## Status
 
-Lab-proven on 2026-09-09: 43 tests green, a local instance with `bge-m3`
-recalls a Thai memory from an English question, MCP `remember → recall → digest`
-round-trips, the atlas draws written `[[links]]`. Not yet deployed on a HAOS
-guest. See `../../../PROPOSAL.md` for the punch list.
+Lab-proven on 2026-09-09:
+
+- **49 tests green on macOS**, and **45 of them re-run green inside
+  `ghcr.io/home-assistant/aarch64-base:3.22`** — the actual HAOS runtime, Alpine
+  musl aarch64, with the `linux-arm64-musl` binding. That is the answer to "will
+  the native dependency work on a Home Assistant guest": measured, not assumed.
+- A local instance with Ollama `bge-m3` recalls a Thai memory from an English
+  question, MCP `remember → recall → digest` round-trips, the atlas draws
+  written `[[links]]`, and a libSQL corpus imports with its vectors and its
+  claude.ai connector intact.
+
+Not yet deployed on a HAOS guest, and the `docker build` of the add-on image has
+not completed **on this Mac** — the colima VM's 20GB disk is 96% full with other
+projects' images, so the build dies in the export step. That is an environment
+limit, not a code one; the runtime it would package is the one proven above, and
+`.github/workflows/builder.yml` builds it on CI where disk is not the issue.
+
+See `../../../PROPOSAL.md` for the punch list.

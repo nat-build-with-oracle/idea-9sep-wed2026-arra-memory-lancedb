@@ -54,11 +54,23 @@ is the survival story that outage asked for.
       English query "moving the memory store to a vector database" recalls the
       Thai memory first by hybrid; graph draws 4 nodes with one written
       `[[link]]`; MCP `remember` → `recall_memories` → `digest` round-trips.
-- [ ] HAOS image: the Dockerfile's bun download step fails under Docker on this
-      Mac (curl exit 23 inside the Alpine base) — a fetch problem, not a
-      LanceDB one; `@lancedb/lancedb-linux-{x64,arm64}-musl` exist on npm.
+- [x] Prove the native dependency on the runtime that matters: 45 of the tests
+      re-run green inside `ghcr.io/home-assistant/aarch64-base:3.22` (Alpine
+      musl aarch64) against `@lancedb/lancedb-linux-arm64-musl`. Thai ngram FTS,
+      vector search, the importer, all of it — on the HAOS libc.
+- [x] Migration: `scripts/import-libsql.ts` carries a corpus across read-only —
+      memories, decoded `F32_BLOB` vectors, the search log, the `kv` table and
+      the OAuth tables, so the claude.ai connector survives. Idempotent by
+      primary key; refuses a dimension mismatch unless `--force`.
+      `src/import.test.ts` proves it against upstream's shipped schema.
+- [ ] HAOS image: `docker build` does not finish **on this Mac** — the colima
+      VM's 20GB disk is 96% full with other projects' images and the export step
+      dies with ENOSPC. Not a LanceDB or Dockerfile fault (the runtime is proven
+      above); CI has the disk. The Dockerfile now installs, builds and prunes in
+      ONE layer, shedding 220MB of onnxruntime/transformers that lancedb lists
+      as optional deps, plus the gnu binding Bun installs alongside the musl one.
 - [ ] Deploy beside `arra_memory` on a HAOS guest (slug `arra_memory_lancedb`,
-      LAN port 8098) and migrate a real corpus with a one-shot importer.
+      LAN port 8098) and run the importer against thor's real corpus.
 
 ## Done when
 
