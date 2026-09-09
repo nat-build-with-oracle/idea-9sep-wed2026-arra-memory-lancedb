@@ -25,20 +25,50 @@ export async function kvGet(key: string): Promise<string | null> {
   return rows[0] ? String(rows[0].value) : null;
 }
 
+/**
+ * One in-flight write per key.
+ *
+ * `key` was a PRIMARY KEY upstream and mergeInsert does not replace that
+ * guarantee: two concurrent merges each read the same table version, each find
+ * no match, and each insert. Lance has no unique constraint to catch it, so the
+ * duplicates are permanent and every later `get` answers from whichever row the
+ * scan reaches first. Measured: eight concurrent puts of one key left eight
+ * rows, and a subsequent sequential put did not collapse them.
+ *
+ * It is reachable from ordinary use — `toggle_tool` twice in one MCP batch, or
+ * two browsers unlocking at the same moment — and the add-on is a single
+ * process, so chaining per key closes it completely and costs nothing.
+ */
+const inflight = new Map<string, Promise<unknown>>();
+
 export async function kvPut(
   key: string,
   value: string,
   options: { expirationTtl?: number } = {},
 ): Promise<void> {
-  const t = await table("kv");
-  const expiresAt = options.expirationTtl ? nowSeconds() + options.expirationTtl : null;
-  // Upsert, so re-issuing a session with the same id refreshes its deadline
-  // instead of leaving two rows behind.
-  await t
-    .mergeInsert("key")
-    .whenMatchedUpdateAll()
-    .whenNotMatchedInsertAll()
-    .execute([{ key, value, expires_at: expiresAt }]);
+  const previous = inflight.get(key) ?? Promise.resolve();
+  const mine = previous
+    // A failed predecessor must not poison the chain; its own caller saw the error.
+    .catch(() => {})
+    .then(async () => {
+      const t = await table("kv");
+      const expiresAt = options.expirationTtl ? nowSeconds() + options.expirationTtl : null;
+      // Upsert, so re-issuing a session with the same id refreshes its deadline
+      // instead of leaving two rows behind.
+      await t
+        .mergeInsert("key")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute([{ key, value, expires_at: expiresAt }]);
+    });
+
+  inflight.set(key, mine);
+  try {
+    await mine;
+  } finally {
+    // Only the last writer clears the slot, so a chain still forming is kept.
+    if (inflight.get(key) === mine) inflight.delete(key);
+  }
 }
 
 export async function kvDelete(key: string): Promise<void> {

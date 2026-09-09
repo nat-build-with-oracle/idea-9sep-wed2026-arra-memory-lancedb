@@ -221,6 +221,23 @@ const listValue = (values: string[]): string[] | null => (values.length ? values
 const newestFirst = (a: Memory, b: Memory) =>
   b.updatedAt.localeCompare(a.updatedAt) || b.importance - a.importance;
 
+/**
+ * Ties in a facet row break the way SQLite's BINARY collation broke them.
+ *
+ * Every facet list upstream ended `ORDER BY count DESC, <value> ASC`, and in
+ * SQLite that second key is a byte comparison: `Beta` sorts before `alpha`
+ * because uppercase letters come first in ASCII. `localeCompare` says the
+ * opposite, and it says it differently depending on the host's ICU data — so
+ * the chip rows, the top-tags list and the generated MCP tool names came back
+ * in another order, and under a LIMIT a different value survived. `<` and `>`
+ * on JS strings compare UTF-16 code units, which agrees with BINARY on the
+ * same UTF-8 bytes for everything in the BMP.
+ *
+ * Timestamps and `YYYY-MM` months are deliberately left on localeCompare:
+ * fixed-format ASCII, where the two orders cannot disagree.
+ */
+const binaryAsc = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 export async function createMemory(input: CreateMemoryInput): Promise<Memory> {
   const content = normalizeText(input.content, "content", 12_000);
   // A missing title is inferred rather than rejected: the MCP client usually
@@ -385,27 +402,36 @@ export async function searchMemoriesNoLog(
     return rows.map(toMemory);
   }
 
-  // The indexed path, when the query is long enough for a trigram.
+  // The indexed path, when the query is long enough for a trigram and no tag
+  // filter is involved — a tag is matched case-insensitively against a
+  // case-preserving list, which no filter expression here can say, so those
+  // queries stay on the scan below exactly as they did upstream.
   //
-  // The inverted index ORs the query's trigrams, so a candidate may match on a
-  // fragment ("bra" in "zebras" finds "brand"). The libSQL version's phrase
-  // MATCH meant "contains this exact text", and that is kept by re-testing
-  // every candidate against the text the index saw — so the index chooses the
-  // order and the substring test chooses membership.
-  if (query.length >= TRIGRAM_MIN) {
+  // MEMBERSHIP IS THE FILTER, RANKING IS THE INDEX. The substring test is in
+  // the WHERE, not applied to the rows that come back, and that ordering is the
+  // whole correctness of this path. The ngram index ORs the query's trigrams,
+  // so rows that merely share trigrams compete for the same slots as rows that
+  // actually contain the query. Filtering afterwards meant the limit truncated
+  // a list of mostly-wrong candidates and the real matches never survived to be
+  // tested: measured on a 403-row corpus, "animals" returned 3 rows at limit
+  // 100 and NOTHING at the default limit of 30. Thai makes it ordinary rather
+  // than adversarial — no spaces means unrelated notes share character
+  // trigrams densely.
+  //
+  // With the predicate pushed down, LanceDB prefilters and `.limit(limit)`
+  // truncates rows that are all genuine matches, which is what upstream's
+  // phrase MATCH + LIMIT did.
+  if (query.length >= TRIGRAM_MIN && !tag) {
     try {
       const candidates = await t
         .search(query, "fts", FTS_COLUMN)
-        .where(scope ?? "true")
+        .where(andWhere(`lower(${FTS_COLUMN}) LIKE ${lit(likePattern(lower))}`, scope)!)
         .select([...MEMORY_COLUMNS, "fts_text"])
-        // Wide enough that the true substring matches are among them even
-        // when many rows share a trigram or two with the query.
-        .limit(Math.max(limit * 5, 200))
+        .limit(limit)
         .toArray();
 
-      const ranked = candidates
+      return candidates
         .map((r: unknown) => plain<MemoryRow & { fts_text: string; _score: number }>(r))
-        .filter((r) => String(r.fts_text).toLocaleLowerCase().includes(lower))
         .map((r) => {
           const memory = toMemory(r);
           // The index cannot weight fields, so the weighting the original
@@ -416,11 +442,8 @@ export async function searchMemoriesNoLog(
           const score = Number(r._score) * (1 + (inTitle ? 2 : 0) + (inTags ? 1 : 0));
           return { memory, score };
         })
-        .filter((x) => !tag || hasTag(x.memory, tag))
         .sort((a, b) => b.score - a.score || newestFirst(a.memory, b.memory))
-        .slice(0, limit)
         .map((x) => x.memory);
-      return ranked;
     } catch {
       // An FTS failure must never mean "no results" — a missing or corrupt
       // index degrades to the scan below rather than lying about the corpus.
@@ -575,7 +598,7 @@ function tally(
   }
   return [...out.entries()]
     .map(([value, { count, latest }]) => ({ value, count, latest }))
-    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+    .sort((a, b) => b.count - a.count || binaryAsc(a.value, b.value));
 }
 
 function tallyTags(rows: FacetRow[]): Array<{ tag: string; count: number }> {
@@ -583,7 +606,7 @@ function tallyTags(rows: FacetRow[]): Array<{ tag: string; count: number }> {
   for (const r of rows) for (const tag of r.tags ?? []) out.set(tag, (out.get(tag) ?? 0) + 1);
   return [...out.entries()]
     .map(([tag, count]) => ({ tag, count }))
-    .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+    .sort((a, b) => b.count - a.count || binaryAsc(a.tag, b.tag));
 }
 
 const inWorkspace = (rows: FacetRow[], workspace?: string) => {
@@ -672,7 +695,7 @@ function tallyWorkspaces(rows: FacetRow[], limit: number): WorkspaceFacet[] {
     .map(([workspace, v]) => ({
       workspace, count: v.count, projects: v.projects.size, agents: v.agents.size, latest: v.latest,
     }))
-    .sort((a, b) => b.count - a.count || a.workspace.localeCompare(b.workspace))
+    .sort((a, b) => b.count - a.count || binaryAsc(a.workspace, b.workspace))
     .slice(0, limit);
 }
 
@@ -786,20 +809,32 @@ export async function mergeFacet(
   // A tag lives inside a list, so the value is replaced within it and the
   // result de-duplicated — a memory already carrying both the source and the
   // target must not end up with the target twice. The FTS column follows.
-  const rows = await scan<{ id: string; title: string; content: string; tags: string[] | null }>(t, {
+  //
+  // ONE statement, deliberately, and both reasons are load-bearing.
+  //
+  // Correctness: fts_text is derived from `title` and `content` AS THE ENGINE
+  // SEES THEM, not from a snapshot this process read earlier. The obvious
+  // implementation — scan the matching rows, then update each from what the
+  // scan returned — writes a stale fts_text over any memory revised while the
+  // merge was running, and full-text search then permanently disagrees with the
+  // stored body. Measured: a memory edited 150ms into a 300-row merge kept its
+  // new content and an fts_text describing the old one, and searching for the
+  // new words returned nothing.
+  //
+  // Cost: that same loop was one commit per row and super-linear with it —
+  // 200 rows in 1.5s, 800 rows in 29s. This form did 402 rows in 92ms, and a
+  // restart cannot leave the vocabulary half-renamed.
+  const tagList = `array_distinct(array_replace_all(tags, ${lit(source)}, ${lit(target)}))`;
+  const result = await t.update({
     where: `array_has(tags, ${lit(source)})`,
-    columns: ["id", "title", "content", "tags"],
+    valuesSql: {
+      tags: tagList,
+      // Must stay identical to ftsText() above: title, newline, content,
+      // newline, tags joined by a single space.
+      fts_text: `concat(title, chr(10), content, chr(10), array_to_string(${tagList}, ' '))`,
+    },
   });
-  let merged = 0;
-  for (const row of rows) {
-    const tags = [...new Set((row.tags ?? []).map((x) => (x === source ? target : x)))];
-    await t.update({
-      where: `id = ${lit(row.id)}`,
-      values: { tags: listValue(tags), fts_text: ftsText(row.title, row.content, tags) },
-    });
-    merged++;
-  }
-  return { facet, from: source, to: target, merged };
+  return { facet, from: source, to: target, merged: Number(result.rowsUpdated ?? 0) };
 }
 
 /** Distinct kinds with counts. Free text now, so this IS the vocabulary. */

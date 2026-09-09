@@ -101,19 +101,39 @@ Everything about connecting Claude Code, Codex and claude.ai — OAuth discovery
 |---|---|
 | `sql.ts`: every statement, `?`-parameterised | no SQL; WHERE strings built only through `lit()` / `likePattern()` / `inList()` |
 | `ORDER BY`, `GROUP BY`, `COUNT(DISTINCT)` | in process, after a scan of the sort/group columns only (`topRows`, `facetRows`) |
-| FTS5 trigram, `MATCH "phrase"`, `bm25(3,1,2)` | ngram(3,3) inverted index for candidates, substring test for membership, title ×3 / tags ×2 boost on the index score |
+| FTS5 trigram, `MATCH "phrase"`, `bm25(3,1,2)` | ngram(3,3) inverted index **ranks**, a pushed-down `LIKE` decides **membership**, title ×3 / tags ×2 boost on the index score |
+| `UPDATE … json_group_array(…)` for a tag merge | one `update` with `valuesSql`, deriving `fts_text` from the live `title`/`content` |
 | `tags` as a JSON string, `json_each` | `tags` as `List<Utf8>`; empty stored as NULL because `UPDATE` cannot write `[]` |
 | `F32_BLOB(1024)` + `libsql_vector_idx` | `FixedSizeList<Float32>`; `vectorSearch().distanceType("cosine")` with a prefilter |
 | `ALTER TABLE ADD COLUMN` migrations | schema is fixed at create; a changed `embedding_dimensions` rebuilds `memories` with vectors cleared (JSON snapshot first) and backfill re-embeds |
 | Turso embedded replica | `LANCEDB_URI=s3://…` with the usual `AWS_*` variables |
 | FTS triggers keep the index in step | rows written after the index are still searched; `optimize()` folds them in every 10 minutes |
 
-Two LanceDB facts that shaped the code and are worth knowing before touching it:
+LanceDB facts that shaped the code and are worth knowing before touching it:
 
 - `apache-arrow` must be **18.1.0** (lancedb's peer range is `>=15 <=18.1`);
   21.x installs fine and then fails to marshal every schema.
 - The FTS tokenizer defaults `removeStopWords: true` and `stem: true`, which
   silently makes "are" and "the" unfindable and mangles trigrams. Both are off.
+- **Membership belongs in the WHERE, never after the limit.** The ngram index
+  ORs the query's trigrams, so rows that merely share trigrams compete for the
+  same slots as rows that contain the query. Filtering after a fixed candidate
+  pool made the same query return three rows at limit 100 and nothing at the
+  default limit of 30. Thai makes that ordinary rather than adversarial.
+- **There is no unique constraint.** `mergeInsert` is not an upsert under
+  concurrency: two writers each read the same table version, each find no
+  match, and each insert. `kv.ts` serialises per key to restore what a PRIMARY
+  KEY used to give.
+- **A lone UTF-16 surrogate truncates a filter string** at that byte, silently
+  dropping every clause after it — including an expiry check. `lit()` and
+  `likePattern()` call `toWellFormed()` for that reason.
+- Facet tie-breaks use byte order, not `localeCompare`, because that is what
+  SQLite's BINARY collation gave and the chip rows are compared against it.
+
+Each of those has a test in `src/regressions.test.ts` that fails without the
+fix — they were all found by an adversarial audit of this port against the
+libSQL original, and every one of them returned a plausible wrong answer rather
+than an error.
 
 ## Measured (m5, Apple Silicon, Bun 1.3.14, no embedder)
 
@@ -123,29 +143,38 @@ bodies, warm process, single run:
 
 | operation | 3,000 memories | 30,000 memories |
 |---|---|---|
-| list newest 30 (`topRows`) | 10 ms | 37 ms |
-| list newest 30, one workspace | 4 ms | 9 ms |
-| FTS "ความจำ" | 7 ms | 9 ms |
-| FTS, scoped to 2 workspaces + kind | 5 ms | 10 ms |
-| 2-char query (substring scan) | 40 ms | 350 ms |
-| tag filter only (full scan) | 26 ms | 229 ms |
-| `listFacets` (every chip row) | 15 ms | 100 ms |
-| range search, last 24h | 7 ms | 7 ms |
-| create / get / update | 4 / 1 / 5 ms | 3 / 4 / 5 ms |
-| insert 3k / 30k rows in 500-row batches | 70 ms | 411 ms |
+| list newest 30 (`topRows`) | 10 ms | 39 ms |
+| list newest 30, one workspace | 4 ms | 10 ms |
+| FTS "ความจำ" | 5 ms | 22 ms |
+| FTS, scoped to 2 workspaces + kind | 4 ms | 21 ms |
+| 2-char query (substring scan) | 41 ms | 361 ms |
+| tag filter (full scan, as upstream) | 25 ms | 221 ms |
+| `listFacets` (every chip row) | 13 ms | 99 ms |
+| range search, last 24h | 6 ms | 6 ms |
+| create / get / update | 3 / 2 / 4 ms | 3 / 3 / 5 ms |
+| merge a facet across the corpus | 5 ms | 23 ms |
+| insert 3k / 30k rows in 500-row batches | 69 ms | 422 ms |
 
-The two slow rows at 30k are the paths that read every body: queries shorter
-than a trigram and a tag-only filter. If a corpus ever gets there, a lowercased
-`tags_lc` column would turn the tag path into a server-side `array_has`.
+The slow rows at 30k are the paths that read every body: queries shorter than a
+trigram, and a tag filter — which stays on the scan on purpose, because a tag is
+matched case-insensitively against a case-preserving list and no filter
+expression can say that. If a corpus ever gets there, a lowercased `tags_lc`
+column would turn the tag path into a server-side `array_has`.
 
 ## Status
 
 Lab-proven on 2026-09-09:
 
-- **49 tests green on macOS**, and **45 of them re-run green inside
-  `ghcr.io/home-assistant/aarch64-base:3.22`** — the actual HAOS runtime, Alpine
-  musl aarch64, with the `linux-arm64-musl` binding. That is the answer to "will
-  the native dependency work on a Home Assistant guest": measured, not assumed.
+- **55 tests green on macOS**, and the 51 that do not need a broker re-run green
+  inside `ghcr.io/home-assistant/aarch64-base:3.22` — the actual HAOS runtime,
+  Alpine musl aarch64, with the `linux-arm64-musl` binding. That is the answer
+  to "will the native dependency work on a Home Assistant guest": measured, not
+  assumed. (The four `fleet.test.ts` cases stand up an MQTT broker and report
+  nothing in that throwaway container; `fleet.ts` is byte-identical to upstream.)
+- An **adversarial audit against the libSQL original** (44 agents, eight
+  dimensions, every finding attacked by two independent skeptics) confirmed
+  nine defects and refuted nine. All nine are fixed, each with a regression
+  test proven to fail without its fix.
 - A local instance with Ollama `bge-m3` recalls a Thai memory from an English
   question, MCP `remember → recall → digest` round-trips, the atlas draws
   written `[[links]]`, and a libSQL corpus imports with its vectors and its

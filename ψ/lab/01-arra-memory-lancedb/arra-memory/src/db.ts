@@ -384,9 +384,19 @@ export async function closeDb(): Promise<void> {
  * A string as a DataFusion literal. The only escape SQL has is doubling the
  * quote; backslashes are ordinary characters. Every value that reaches a WHERE
  * string goes through here — there is no interpolation of raw input anywhere.
+ *
+ * `toWellFormed()` first, and it is not decoration. A lone UTF-16 surrogate —
+ * which a JSON body may legally carry, since JSON does not require well-formed
+ * pairs — cannot be encoded as UTF-8, and the filter string is TRUNCATED at
+ * that byte on its way into the engine. Everything after it silently vanishes,
+ * including the clause that follows: measured on this build, one stray
+ * '\uD800' inside a workspace value deleted the rest of the expression. That is
+ * how an expiry check (`... AND (expires_at IS NULL OR expires_at > now)`)
+ * stops being applied, which is why this lives in the escaper rather than in
+ * whichever caller happens to remember.
  */
 export function lit(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+  return `'${value.toWellFormed().replace(/'/g, "''")}'`;
 }
 
 /** `(‘a’, ‘b’)` — the caller guarantees the list is non-empty. */
@@ -396,7 +406,7 @@ export function inList(values: string[]): string {
 
 /** `%needle%` for LIKE, with LIKE's own wildcards neutralised. */
 export function likePattern(needle: string): string {
-  return `%${needle.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  return `%${needle.toWellFormed().replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
 /** Joins the defined clauses with AND; undefined when there are none. */
