@@ -1,0 +1,9 @@
+node_modules/
+# Built UI assets — built into the image, never shipped in git.
+**/public/main.js
+**/public/app.css
+# Local corpora from dev runs.
+**/lancedb/
+.data/
+.env
+.dev.vars

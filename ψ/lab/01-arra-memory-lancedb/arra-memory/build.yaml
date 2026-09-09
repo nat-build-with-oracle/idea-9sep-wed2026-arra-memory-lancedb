@@ -1,0 +1,21 @@
+# The base image per architecture, for the official Home Assistant builder.
+#
+# The Dockerfile pins one digest for local `docker build`; the builder overrides
+# BUILD_FROM per arch from this file. Both must name the same base or a locally
+# verified image proves nothing about the published one — so these are the same
+# 3.22 tags the pinned digest resolves from.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base:3.22
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.22
+
+# NOTE: no `args:` block, deliberately.
+#
+# BUILD_ARCH, BUILD_FROM and BUILD_VERSION are supplied by the builder itself —
+# Supervisor's own build line shows it: `--build-arg BUILD_ARCH=amd64`. Setting
+# `args: {BUILD_ARCH: "{arch}"}` here does not template; it OVERRIDES the real
+# value with the literal string "{arch}", and the Dockerfile's arch case then
+# falls through to "unsupported arch: {arch}".
+
+labels:
+  org.opencontainers.image.source: https://github.com/Soul-Brews-Studio/arra-memory-haos
+  org.opencontainers.image.licenses: MIT

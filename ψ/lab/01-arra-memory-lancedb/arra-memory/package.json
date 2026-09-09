@@ -1,0 +1,37 @@
+{
+  "name": "arra-memory-lancedb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A durable memory corpus for Home Assistant on LanceDB, served in the sidebar and to Claude over MCP.",
+  "scripts": {
+    "dev": "bun run build:ui && bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "build:ui": "bun run sync:version && bun run build:js && bun run build:css",
+    "build:js": "bun build src/ui/main.tsx --outdir public --minify --target browser",
+    "build:css": "bun node_modules/@tailwindcss/cli/dist/index.mjs -i src/ui/app.css -o public/app.css --minify",
+    "typecheck": "tsc --noEmit",
+    "test": "bun run test:each",
+    "sync:version": "bun scripts/sync-version.ts",
+    "test:each": "for f in src/*.test.ts; do echo \"── $f\"; NODE_ENV=test bun test \"$f\" || exit 1; done"
+  },
+  "dependencies": {
+    "@kitajs/html": "^4.2.9",
+    "@lancedb/lancedb": "^0.38.0",
+    "apache-arrow": "18.1.0",
+    "elysia": "^1.4.29",
+    "mqtt": "^5.15.2",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.14",
+    "@types/bun": "^1.4.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/three": "^0.185.4",
+    "tailwindcss": "^4.1.14",
+    "typescript": "^5.9.0"
+  }
+}

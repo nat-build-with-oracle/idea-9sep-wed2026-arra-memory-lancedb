@@ -1,0 +1,142 @@
+name: "Arra Memory (LanceDB)"
+version: "0.28.0"
+slug: "arra_memory_lancedb"
+description: >-
+  A durable memory corpus that lives in your Home Assistant sidebar and answers
+  to Claude over MCP. Memories, vectors and full-text index are stored in an
+  embedded LanceDB directory under the add-on's own /data, so they survive
+  restarts and ride along in Home Assistant's backups.
+url: "https://github.com/nat-build-with-oracle/idea-9sep-wed2026-arra-memory-lancedb"
+
+# No `image:` line yet, deliberately.
+#
+# The libSQL original points Supervisor at a prebuilt ghcr.io image so an
+# install is a pull rather than a build on the Home Assistant host. This port
+# has no published image, and pointing at a tag that does not exist breaks the
+# installed add-on rather than the install. Until .github/workflows/builder.yml
+# has run against a public repo, Supervisor builds locally from the Dockerfile.
+arch:
+  - amd64
+  - aarch64
+startup: application
+# boot: auto — a host reboot leaves `boot: manual` add-ons stopped, and a
+# stopped add-on reads as a failed install when it is nothing of the kind.
+boot: auto
+# The HA base image ships s6-overlay and owns PID 1 via ENTRYPOINT ["/init"].
+init: false
+hassio_api: false
+homeassistant_api: false
+host_network: false
+# The sidebar panel. ingress_panel is still FALSE by default on a fresh install
+# in some Supervisor versions — if the icon does not appear, that flag is why.
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:brain
+panel_title: Memory
+panel_admin: false
+# A LAN port in addition to ingress, because ingress alone cannot serve MCP.
+#
+# Ingress authenticates with Home Assistant's own session and rewrites the path
+# under a per-session token — fine for a browser, impossible for an MCP client,
+# which has no HA session and must reach a stable URL with its own bearer or
+# OAuth credentials. Nothing is exposed beyond the LAN by this: a Cloudflare
+# Tunnel, if you use one, still dials outward and opens no inbound port.
+#
+# 8098 rather than 8099 so this add-on can run BESIDE the libSQL one on the
+# same host during a migration. Set to null in the Network tab to close it.
+ports:
+  8099/tcp: 8098
+ports_description:
+  8099/tcp: "MCP endpoint and API for Claude Code, Codex, and tunnels"
+# The corpus lives here. /data is the only path Supervisor persists across
+# restarts AND includes in Home Assistant backups.
+map:
+  - data:rw
+stage: experimental
+options:
+  # Owner passphrase for the web UI and for approving MCP clients. Generate one
+  # (`openssl rand -base64 32`) and set it in this add-on's Configuration tab.
+  # Blank means the add-on refuses to start rather than serving your memories
+  # to anyone who finds the URL.
+  owner_passphrase: ""
+  # Optional static bearer token for scripts, curl, and MCP clients that read a
+  # config file (Claude Code, Codex). claude.ai connectors CANNOT send a static
+  # header and must use the OAuth flow instead — that is why both exist. Blank
+  # disables this path entirely, leaving OAuth and the web session.
+  api_token: ""
+  # Optional public origin, e.g. https://memory.example.com — set ONLY when this
+  # add-on is published through a tunnel and a remote MCP client needs absolute
+  # OAuth URLs. Blank = derive every URL from the incoming request, which is
+  # correct for LAN and ingress use.
+  public_url: ""
+  # What this instance calls itself — the MCP serverInfo name claude.ai displays,
+  # the UI chrome title, and the health `name`. Empty means "Arra Memory". Data
+  # is never renamed by this; it is identity, not schema.
+  instance_name: ""
+  # Semantic search, off unless you point it at an Ollama server. It does NOT
+  # have to be on this machine — a box on your LAN or private mesh is better,
+  # since a HAOS host rarely has room for a model. Blank = keyword search only.
+  ollama_url: ""
+  # bge-m3 is the default because it is genuinely multilingual: measured on a
+  # real corpus, a Thai sentence scores 0.84 cosine similarity against its own
+  # English translation and 0.32 against unrelated Thai. That means an English
+  # query finds a Thai memory. An English-first model cannot do that.
+  embedding_model: "bge-m3"
+  # Must match the model. bge-m3 is 1024; nomic-embed-text is 768. The vector
+  # column is sized when the table is created; changing this afterwards
+  # rebuilds the table with every vector cleared (a JSON snapshot is written
+  # beside it first) and backfill re-embeds everything with the new model.
+  embedding_dimensions: 1024
+  # Record every search — the query text AND which memories came back.
+  #
+  # Off by default, and that is not timidity. A search log is often more
+  # revealing than the corpus it searches: what someone looked for says more
+  # than what they wrote down. Turn it on when "what was I searching for last
+  # week" is worth more to you than not keeping that record.
+  # Manage it with the list_search_log and forget_search_log MCP tools.
+  search_log: false
+  # Off by default, and that is a measurement not a preference: on a real
+  # corpus the generated tools were 18 of 34 and 4,328 of 7,133 tokens — 61%
+  # of what every MCP client carries on every request. They are also strictly
+  # redundant (recall_project_X is recall_memories with a project filter), and
+  # list_projects answers the discovery question they existed to answer.
+  generated_tools: false
+  # The DEFAULTS the interface opens with, set by whoever runs the add-on.
+  # A browser that has chosen otherwise keeps its choice — these decide what a
+  # first visit looks like, not what anyone is stuck with.
+  language: "th"
+  theme: "slate"
+  # ── the fleet, over MQTT (optional) ────────────────────────────────────────
+  # Point this at the fleet's broker and this add-on becomes the door claude.ai
+  # does not otherwise have: it cannot open an MQTT connection or reach a LAN
+  # address, but it can call an MCP tool here. list_fleet then shows who is
+  # alive, and send_to_oracle publishes into another oracle's channel.
+  #
+  # Blank disables all three fleet tools rather than offering tools that always
+  # fail — an unusable tool still costs every client context on every request.
+  mqtt_url: ""
+  mqtt_username: ""
+  mqtt_password: ""
+  # Topic root. Every member lives under <prefix>/<name>/… and nothing here ever
+  # subscribes to `#` — the fleet broker carries roughly 109 GB/day.
+  mqtt_prefix: "oracle"
+schema:
+  owner_passphrase: password
+  api_token: password
+  # `str` and NOT `url?`: an optional URL key whose shipped default is ""
+  # fails Supervisor's options validation BEFORE the container is created, so
+  # the add-on never starts and its log is EMPTY — the only trace is one line
+  # in the supervisor log. Learned the hard way, 2026-08-27.
+  public_url: str
+  instance_name: str
+  ollama_url: str
+  embedding_model: str
+  embedding_dimensions: int
+  search_log: bool
+  generated_tools: bool
+  language: "list(th|en)?"
+  theme: "list(slate|ember|moss|iris|mono|paper)?"
+  mqtt_url: str
+  mqtt_username: str
+  mqtt_password: password
+  mqtt_prefix: str

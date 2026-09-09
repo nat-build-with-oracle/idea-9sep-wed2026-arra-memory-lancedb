@@ -1,0 +1,75 @@
+name: Publish add-on images
+
+# Why this exists: without a published image, Supervisor builds the add-on on
+# the Home Assistant host itself — every install, on every machine, pulling the
+# Alpine base and a ~90MB bun tarball over whatever connection that host has.
+# It also means a build failure surfaces as "update succeeded, old version still
+# running", because Supervisor reports the request rather than the result.
+#
+# Building here instead makes an install a pull, and makes a broken build a red
+# X on a commit rather than a silent no-op on someone's home server.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "arra-memory/**"
+      - ".github/workflows/builder.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to ghcr.io under this repository's owner.
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both architectures config.yaml advertises. A published amd64-only
+        # image would make the add-on silently uninstallable on a Pi or an
+        # Apple-silicon guest, which is the arch list quietly lying.
+        arch: [amd64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version Supervisor will look for is the one in config.yaml — the
+      # same file scripts/sync-version.ts reads, so the tag, /api/health, and
+      # the add-on store cannot disagree about which build this is.
+      - name: Read the version from config.yaml
+        id: version
+        run: |
+          version=$(sed -n 's/^version: *"\(.*\)"/\1/p' arra-memory/config.yaml)
+          if [ -z "$version" ]; then
+            echo "::error file=arra-memory/config.yaml::no version: line found"
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          # ghcr namespaces must be lowercase; this owner is "Soul-Brews-Studio".
+          # Pushing with the mixed-case name is rejected by the registry, so it
+          # is folded here rather than hard-coded and left to rot on a rename.
+          echo "owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "Building $version for ${{ matrix.arch }}"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: home-assistant/builder@master
+        with:
+          # --addon makes the builder read config.yaml and build.yaml itself,
+          # so the version tag and the per-arch base come from the add-on
+          # rather than being restated here and drifting.
+          args: |
+            --${{ matrix.arch }} \
+            --target arra-memory \
+            --image {arch}-addon-arra_memory_lancedb \
+            --docker-hub ghcr.io/${{ steps.version.outputs.owner }} \
+            --addon
